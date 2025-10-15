@@ -1,0 +1,62 @@
+## Writing gitignore file
+# ---- Python build & cache files ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# ---- Jupyter notebooks ----
+.ipynb_checkpoints/
+
+# ---- Data files (large or raw) ----
+# Data/
+# data/
+# datasets/
+# *.csv
+# *.tsv
+# *.xlsx
+# *.xls
+# *.pkl
+# *.pickle
+# *.feather
+# *.parquet
+# *.json
+# *.zip
+
+# ---- Model weights or outputs ----
+# models/
+# outputs/
+# results/
+*.h5
+*.pt
+# *.joblib
+*.sav
+*.npy
+*.npz
+
+# ---- Environment / configuration ----
+.env
+*.env
+.venv/
+venv/
+ENV/
+env/
+*.log
+
+# ---- IDE / Editor specific ----
+.vscode/
+.idea/
+*.iml
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Temporary / scratch ----
+tmp/
+temp/
+scratch/
