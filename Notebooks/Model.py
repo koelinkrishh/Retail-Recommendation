@@ -3,18 +3,19 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 import time
-from sklearn.model_selection import train_test_split
-import joblib
+import math
+import tqdm
 
-import matplotlib.pyplot as plt
-import seaborn as sns
+import pickle
+import joblib
+import copy
 
 from itertools import combinations
 from datetime import datetime
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# %%
+
 ## Reading datasets
 df = pd.read_parquet('../Data/data_with_features.parquet')
 customer = pd.read_pickle('../Data/customer_history.pkl')
@@ -30,34 +31,27 @@ d_effect = 0.5 # decay factor
 Today = pd.Timestamp(df['Purchase Date'].max()) + pd.DateOffset(days=1)
 Time_period = (df['Purchase Date'].max() - df['Purchase Date'].min()).days
 
-# %%
+
 EPS = 1e-9  # small constant to avoid log(0) / division by zero
 DEFAULT_HALF_LIFE_DAYS = 7  # used in recency k_max
 MAGIC_KMIN_PERIOD = 30  # relative baseline for kmin computation (can be tuned)
 
-class Retail_Recommendation():
+
+
+class Retail_Recommendation:
     """
-    Batch-capable hybrid recommender combining:
-      - item bias (popularity)
-      - per-customer purchase history affinity
-      - association-rule boosts
-      - per-basket description similarity
-      - per-basket / per-customer price-affordability (budget)
-      - recency boost per (user,item)
-      - discount boost (batch-level)
-    
-    This class computes item-level arrays once and then scores baskets in vectorized form.
+    Extremely optimized version (description boost removed).
+    Uses full NumPy vectorization, cached arrays, and minimal loops.
     """
-    def __init__(self, item_data=items, customer_data=customer, association=rules, vectorizer=None, vectorizer_path=None, 
-            Initial_weights=None, d_effect=1, current_date=None, Time_period=None, rescale_features=True,
-        ## These variable are basket specific
-            # Id=-1, budget=None, Discount=None
-        ):
+
+    def __init__(self, items_data, customer_data, rules, vectorizer=None, vectorizer_path=None,
+                 initial_weights=None, d_effect=1, current_date=None, Half_life = 7, Time_period=100, 
+                 filter_items=False, include_description=False, iteration_bar = True):
         """
         Args:
-            items_df (pd.DataFrame): must contain ['StockCode','Description','Current_Price',
+            items_data (pd.DataFrame): must contain ['StockCode','Description','Current_Price',
                                                   'Total_quantity','Num_orders'].
-            customer_df (pd.DataFrame): rows may contain dicts in columns 'Purchase count',
+            customer_data (pd.DataFrame): rows may contain dicts in columns 'Purchase count',
                                         'Purchase quantity', 'Last purchase date'.
             rules_df (pd.DataFrame): cols ['antecedent','consequent','confidence','lift'].
             vectorizer: optional pre-trained sklearn vectorizer for descriptions (TF-IDF).
@@ -66,313 +60,628 @@ class Retail_Recommendation():
             d_effect: base recency multiplier for items (floats).
             today: pd.Timestamp or pd.Date for "current" date; if None derived from items_df if possible.
             time_period: integer days span; if None computed from items_df.
-            rescale_features: whether to min-max rescale additive features per basket before weighting.
+            filter_items: bool, whether to remove rare items from item data.
+            include_description: bool, whether to use description similarity.
+            iteration_bar: bool, whether to show a progress bar for scoring.
         """
-        self.item_data = item_data
+        self.iteration_bar = iteration_bar
+        
+        self.item_data = items_data.copy()
         self.customer_data = customer_data
-        self.association_rules = association
-        
-        if Initial_weights is None:
-            Initial_weights = {}
-        
-        self.all_items = np.asarray(self.item_data['StockCode'].unique())
+        self.rules = rules
+
+        # Items setup
+        if filter_items is True:
+            self._remove_rare_items()
+        self.all_items = np.array(self.item_data['StockCode'].values)
+        self.item_to_index = {item: i for i, item in enumerate(self.all_items)}
         self.n_items = len(self.all_items)
-        # Hyper-parameters ( weights )
-        if Initial_weights is None:
-            Initial_weights = {'alpha': 0.5, 'beta': 0.4, 'delta': 0.1, 'gamma': 0.2, 'epsilon': 0.3, 'eta': 0.3}
-        self.Initial_weights = Initial_weights
-        
+
+        # Time and weights
+        default_weights = {
+            'alpha': 0.5,   # history
+            'beta': 0.4,    # rules
+            'gamma': 0.2,   # recency multiplier weight
+            'delta': 0.1,   # price
+            'epsilon': 0.3, # description similarity
+            'eta': 0.3,     # discount
+        }
+        self.weights = default_weights if initial_weights is None else dict(initial_weights)
+        # ensure all keys exist
+        for k, v in default_weights.items():
+            self.weights.setdefault(k, v)
+
         self.d_effect = float(d_effect)
-        self.rescale_features = bool(rescale_features)
         
-        # Today & Time period
-        if current_date is None:
-            self.current_date = self.item_data['Purchase Date'].max().date() + pd.DateOffset(days=1)
-        else:
-            self.current_date = pd.Timestamp(current_date)
-        if Time_period is None:
-            self.Time_period = (self.item_data['Last_sale'].max() - self.item_data['Last_sale'].min()).days or MAGIC_KMIN_PERIOD
-        else:
-            self.Time_period = Time_period
+        self.current_date = ( pd.Timestamp.now().date() if current_date is None else pd.Timestamp(current_date) )
+        self.Time_period = (
+            pd.Timedelta(days=100) # (items_data['Last_sale'].max() - items_data['Last_sale'].min()).days
+            if Time_period is None else Time_period
+        )
+        self.half_life = Half_life
+
+        # Caches -> keted by (cust_id, d_effect)
+        self.history_cache = {}
+        self.recency_cache = {}
+
+        # Precompute static arrays
+        self.Bias = self._compute_bias()
+        self.rules_lookup = self._build_rules_index()
+        self.rules_boost = self._prepare_rules_boost()
         
-        """ Common CODE -> For optimization """
-        # Dictionary mapping each rules with its items with quantities
-        self.rules_mapper = self._build_rules_index(self.association_rules)
+        self.include_description = include_description
+        
+        if self.include_description:
+                # ----------------- Description similarity -----------------
+            if 'Clean_Description' not in self.item_data.columns:
+                self.item_data = self.item_data.copy()
+                self.item_data['Clean_Description'] = (self.item_data['Description'].str.lower().str.replace('[^A-Za-z]+',' ', regex=True).str.strip())
+            if vectorizer is None:
+                if vectorizer_path:
+                    import joblib
+                    vectorizer = joblib.load(vectorizer_path)
+                else:
+                    vectorizer = TfidfVectorizer(ngram_range=(1,2), stop_words='english')
+                    vectorizer.fit(self.item_data['Clean_Description'])
+            self.vectorizer = vectorizer
+
+            self.vocab = self.vectorizer.transform(self.item_data['Clean_Description'])
+            self.similarity_matrix = cosine_similarity(self.vocab, dense_output=False).astype(np.float32)
         
         
-    # ----- Helper functions -----   
-    @staticmethod ## methods which dont need object
-    def normalize_dict(d:dict):
-        max_val = max(d.values()) if d else 1
-        return {k: v / max_val for k, v in d.items()}
+
+    # ------------------ Helper methods ------------------
+    def _remove_rare_items(self, min_orders=300, min_customers=100):
+        """
+        Filter items to keep only those with sufficient popularity (Frequency > min_orders).
+        Also cleans customer_data dictionaries to remove rare/unused items.
+
+        Args:
+            min_orders : int
+                Minimum number of orders required for an item to be kept.
+            min_customers : int
+                Minimum number of unique customers required for an item to be kept.
+        """
+        df = self.item_data
+        mask = (df['Num_orders'] > min_orders) & (df['Num_customers'] > min_customers)
+        self.item_data = df.loc[mask].reset_index(drop=True)
+        self.all_items = np.asarray(self.item_data['StockCode'].values)
+        self.item_to_index = {item: i for i, item in enumerate(self.all_items)}
+        self.n_items = len(self.all_items)
+        
+        print(f"Number of important items: {self.item_data.shape[0]}")
     
     @staticmethod
-    def Softmax_normalizer(x:dict):
-        val = np.array(list(x.values()))
-        prob = (val - val.min())/(val.max() - val.min())
-        e_x = np.exp(prob)
-        prob = e_x / e_x.sum()
-        return dict(zip(x.keys(), prob))
+    def _normalize_dict(d):
+        if not d:
+            return {}
+        mv = max(d.values())
+        if mv == 0:
+            return {k: 0.0 for k in d}
+        return {k: v / mv for k, v in d.items()}
     
-    def _build_rules_index(self, rules_df):
+    @staticmethod
+    def _normalize_array(a):
+        a = np.asarray(a, dtype=np.float32)
+        amax = a.max() if a.size > 0 else 0.0
+        if amax == 0:
+            return a
+        return (a) / (amax + EPS)
+
+    def _build_rules_index(self):
+        lookup = defaultdict(list)
+        for _, r in self.rules.iterrows():
+            ant = tuple(sorted(r['antecedent']))
+            lookup[ant].append(r)
+        return lookup
+
+    def _prepare_rules_boost(self):
+        rb = {}
+        for ant, rows in self.rules_lookup.items():
+            boost_vector = defaultdict(float)
+            for r in rows:
+                boost_val = r['confidence'] * math.log1p(r['lift'])
+                for conseq in r['consequent']:
+                    boost_vector[conseq] += boost_val
+            # Normalize
+            rb[ant] = self._normalize_dict(boost_vector)
+        return rb
+
+    def _compute_bias(self):
         """
-        Build a dictionary mapping antecedent tuple (sorted) -> list of (consequent_list, confidence, lift).
+        Compute the bias feature vector for all items.
+
+        The bias feature is the item's frequency, normalized by
+        the maximum frequency.
+
+        Returns:
+            bias : numpy.ndarray
+                A vector of the bias feature for all items.
         """
-        rules_lookup = defaultdict(list) # dictionary for faster lookup -> *O[1]
-        for _,row in self.association_rules.iterrows():
-            ant = tuple(sorted(row['antecedent']))
-            rules_lookup[ant].append(row)
-        return rules_lookup
-    
-    # ----- Feature computation -----
-    def compute_bias(self):
-        bias = {}
-        for _,row in self.item_data.iterrows():
-            bias[row['StockCode']] = np.log1p(row['Frequency'])
-        return self.normalize_dict(bias)
-    
-    def compute_price_bias(self, budget=None):
-        price_bias = {}
-        if budget is None:
-            return price_bias
-        
-        for _, row in self.item_data.iterrows():
-                ratio = budget / row.get('Current Price', 0)
-                price_bias[row['StockCode']] = np.log1p(ratio)
-        
-        return self.normalize_dict(price_bias)
-    
-    def compute_history_batch(self, baskets_cust_ids):
+
+        freq = self.item_data['Frequency'].values
+        bias = np.log1p(freq).astype(np.float32)
+        return self._normalize_array(bias)
+
+    # ------------------ Feature computations ------------------
+    def compute_history(self, cust_id):
         """
-            baskets_cust_ids : customer id of all customer whose baskets are being processed
-        """
-        history_map = {}
-        for cid in baskets_cust_ids: # for each customer
-            history = {} # map their baskets together
-            # each customer's data
-            cust_data = self.customer_data[self.customer_data['Customer ID']==cid]
-            
-            if not cust_data.empty:
-                count_dict = cust_data['Purchase count'].iloc[0]
-                qty_dict = cust_data['Purchase quantity'].values[0]
-                
-                # for each item bought by each customer, compute effect
-                for item in count_dict.keys():
-                    history[item] = np.log1p(qty_dict.get(item, 0) / count_dict.get(item, 0))
-                # normalize effect across entire
-                history = self.normalize_dict(history)
-            
-            history_map[cid] = history
-        return history_map
-    
-    def compute_rules_batch(self, baskets_df):
-        baskets_rule_map = {}
-        for idx, row in baskets_df.iterrows(): # for each basket
-            if isinstance(row['StockCode'], (list,set)):
-                current_basket = set(row['StockCode'])
-            else: # empty basket
-                current_basket = set()
-            
-            rules_boost = {}
-            itemsets = set(list(combinations(current_basket, 1)) + list(combinations(current_basket, 2)))
-            
-            """ We have an better version of this part
-            for itemset in itemsets:
-                matches = self.association_rules[self.association_rules['antecedent'] == itemset] # list lookup -> O[n]
-                for _, r in matches.iterrows():
-                    for item in r['consequent']:
-                        boost = r['confidence'] * np.log1p(r['lift'])
-                        rules_boost[item] = rules_boost.get(item, 0) + boost
-            """
-            rules_lookup = defaultdict() # dictionary for faster lookup -> *O[1]
-            for _,row in self.rules.iterrows():
-                ant = tuple(sorted(row['antecedent'])) 
-                rules.index[ant].append(row)
-            
-            for itemset in itemsets:
-                for row in rules_lookup.get(itemset, []): # O[1] lookup
-                    for item in row['consequent']:
-                        boost = row['confidence'] * np.log1p(row['lift'])
-                        rules_boost[item] = rules_boost.set(item, 0) + boost
-            
-            # for each basket
-            baskets_rule_map[idx] = self.normalize_dict(rules_boost)
-        return baskets_rule_map
-    
-    def compute_discount_boost(self, Discount=None):
-        if Discount is None:
-            discount_boost = {}
-        else:
-            discount_boost = {item: np.log1p(Discount[item]) for item in Discount.keys()}
-            discount_boost = self.normalize_dict(discount_boost)
-        return discount_boost
-    
-    
-    def compute_recency_bias_batch(self, baskets_cust_ids):
-        recency_map = {}
-        kmax = np.log(2)/ self.Time_period
-        kmin = np.log(2)/ 7
-        
-        for cid in baskets_cust_ids: # for each customer
-            # map their baskets together
-            recency = {item: d_effect for item in self.all_items} # Recency vector
-            cust_data = self.customer_data[self.customer_data['Customer ID']==cid] # each customer's data
-            
-            if cust_data.empty:
-                recency_map[cid] = recency
-                continue
-            
-            qty_dict = cust_data['Purchase quantity'] # all previous purchases
-            
-                # for each item, Frequency of purchase
-            freq = {}
-            for item in self.all_items: 
-                qty = qty_dict.get(item, 0)
-                freq[item] = np.sqrt(np.log1p(qty)) #
-            freq = self.normalize_dict(freq)
-                # for each item, decay factor
-            K = {}
-            for item in self.all_items:
-                K[item] = kmin + (kmax-kmin)*freq[item]
-                # for each item, Time delta from last purchase
-            last_purchase = cust_data['Last purchase date'].values[0]
-            for item, last in last_purchase.items():
-                print(last)
-                delta_days = (self.current_date - last).days
-                recency[item] *= (1+np.exp(-K[item] * delta_days))
-            
-            recency_map[cid] = recency    
-        return recency_map
-    
-    def compute_description_similarity_batch(self, baskets):
-        """ Compute TF-IDF based description similarity for each basket.
-            Returns: dict[basket_index] -> {item_code: similarity_score}
-        """
-        # step-1: Clean item description
-        if 'Clean_Description' not in self.item_data.columns:
-            self.item_data['Clean_Description'] = self.item_data['Description'].str.lower().str.replace('[^A-Za-z]+', ' ', regex=True).str.strip()
-        
-        # step-2: First Load Vocabulary (or Train)
-        if self.vectorizer is not None:
-            self.vectorizer = vectorizer
-        elif self.vectorizer_path is not None:
-            self.vectorizer = joblib.load(self.vectorizer_path)
-        else: # train vectorizer from scratch
-            vocab = TfidfVectorizer(ngram_range=(1,2), stop_words='english')
-            vocab.fit(self.item_data['Clean_Description'])
-            # store it back for future use
-            self.vectorizer = vocab
-            
-        # step-3: Vectorize the item catalog (sparse matrix)
-        self.item_desc_matrix = vocab.transform(self.item_data['Clean_Description']) # shape -> (n_items X n_features)
-        
-        # step-4: Iterate over each basket
-        basket_similarity_map = {}
-        for idx, row in baskets.iterrows():
-            if isinstance(row['StockCode'], (list,set)):
-                current_basket = set(row['StockCode'])
-            else: # empty basket
-                current_basket = set()
-            
-            if not current_basket:
-                basket_similarity_map[idx] = {}
-                continue
-            
-            # step-5: Find all basket item vectors
-            basket_ind = np.isin(self.all_items, list(current_basket))
-            basket_vector = self.item_desc_matrix[basket_ind] ## (no of items in basket X n_features)
-            ## average semantic meaning of all items in basket -> Capture overall basket's theme
-            basket_mean = np.asarray(basket_vector.mean(axis=0))
-            # print("Basket mean shape: ", basket_mean.shape) # (1 X n_features)
-            
-            # step-6: Filter out items already in basket  for recommendation
-            mask = ~basket_ind
-            avaliable_items = self.all_items[mask]
-            avaliable_items_matrix = self.item_desc_matrix[mask]
-            
-            # step-7: Compute cosine similarity:
-            """ We will also flatten out similarity -> one vector per item in the catalog """ 
-# Idea: "“How similar is this catalog item’s description to the average semantic theme of the basket?”"
-            sims = cosine_similarity( avaliable_items_matrix, basket_mean ).flatten()
-            
-            # step-8: Store similarity score for current basket
-            sims_dict = {item: score for item, score in zip(avaliable_items, sims) if score > 0}
-            basket_similarity_map[idx] = sims_dict
-        
-        return basket_similarity_map
-    
-    # ----- Aggregation -----
-    def recommend(self, baskets, Coefficients = None, budget=None, Discount_list=None, top_n = 5):
-        """ Final Function to aggregate all features for recommendation system. 
-        
+        Compute the history feature vector for a given customer.
+
+        The history feature is the item's purchase quantity normalized by
+        the item's purchase count, and then normalized by the maximum value.
+
         Args:
-        baskets: pd.DataFrame
-            Collections of all baskets being processing currently along with customer_ids
-        Coefficients : dict
-            All features weights -> Need to given while training
-        budget: dict
-            Budget associated with each baskets
-        Discount_list: dict
-            Percentage of discount for each item
-        top_n: integer
-            How many items to recommend
-        
+            cust_id : int
+                The customer ID for which to compute the history feature.
+
+        Returns:
+            hist : numpy.ndarray
+                A vector of the history feature for all items.
         """
-        if Coefficients is None:
-            Coefficients = self.Initial_weights
-        ## Unpacking coefficients
-        self.alpha = Coefficients.get('alpha',1)
-        self.beta = Coefficients.get('beta',1)
-        self.gamma = Coefficients.get('gamma',1)
-        self.delta = Coefficients.get('delta',1)
-        self.episilon = Coefficients.get('episilon',1)
-        self.eta = Coefficients.get('eta',1)
+        if cust_id in self.history_cache:
+            return self.history_cache[cust_id]
+
+        cust_data = self.customer_data[self.customer_data['Customer ID'] == cust_id]
+        hist = np.zeros(self.n_items, dtype=np.float32)
+        if cust_data.empty:
+            self.history_cache[cust_id] = hist
+            return hist
+
+        count = cust_data.iloc[0]['Purchase count']
+        qty = cust_data.iloc[0]['Purchase quantity']
+
+        for item, q in qty.items():
+            idx = self.item_to_index.get(item)
+            quantity = qty.get(item, 0)
+            hist[idx] = math.log1p(quantity / count[item])
+
+        if hist.max() > 0:
+            hist /= (hist.max() + EPS)
+        self.history_cache[cust_id] = hist
+        return hist.copy()
+
+    def compute_recency(self, cust_id, d_effect = None):
+        """
+        Compute the recency feature vector for a given customer.
+
+        The recency feature is the item's purchase quantity normalized by
+        the item's purchase count, and then normalized by the maximum value.
+
+        Args:
+            cust_id : int
+                The customer ID for which to compute the recency feature.
+            d_effect: float
+                The decay factor for the recency feature.
+
+        Returns:
+            rec : numpy.ndarray
+                A vector of the recency feature for all items.
+        """
+        if d_effect is None: d_effect = float(self.d_effect)
         
-        # Precomputing each effect
-        baskets_customer_ids = baskets['Customer ID'].tolist()
-        Bias_i = self.compute_bias()
-        H_map_u = self.compute_history_batch(baskets_customer_ids) # history of each customer
-        T_map_u = self.compute_recency_bias_batch(baskets_customer_ids) # last customer purchase recency for each customer
-        R_map_ui = self.compute_rules_batch(baskets) # recency bias for each customer for each item
-        C_map_i = self.compute_description_similarity_batch(baskets) # description similarity score for each item
-        D_map_i = self.compute_discount_boost(Discount=Discount_list) # discount applied on each item
         
-        Results = {} # Each baskets probability
-        # for each baskets
-        for idx, row in baskets.iterrows():
-            cid = row['Customer ID']
-            baskets_items = row['StockCode'] if isinstance(row['StockCode'], (list,set)) else [row['StockCode']]
+        cache_key = (cust_id, float(d_effect))
+        if cache_key in self.recency_cache:
+            return self.recency_cache[cache_key].copy()
+        
+        cust_data = self.customer_data[self.customer_data['Customer ID'] == cust_id]
+        rec = np.ones(self.n_items, dtype=np.float32)
+        if cust_data.empty:
+            self.recency_cache[cache_key] = rec
+            return rec
+
+        qty_dict = cust_data.iloc[0]['Purchase quantity']
+        freq = np.array([math.sqrt(math.log1p(qty_dict.get(it, 0))) for it in self.all_items], dtype=np.float32)
+        freq /= (freq.max() + EPS)
+
+        kmin = np.log(2) / self.half_life
+        if isinstance(self.Time_period, (int, float)):
+            tp_days = max(1.0, float(self.Time_period))
+        else:
+            tp_days = max(1.0, float(getattr(self.Time_period, "days", 100)))
+        kmax = np.log(2) / tp_days
+        K = kmin + (kmax - kmin) * freq
+
+        last_purchase = cust_data.iloc[0]['Last purchase date']
+        deltas = np.array(
+            [(self.current_date - last_purchase.get(it, self.current_date)).days for it in self.all_items],
+            dtype=np.float32
+        )
+
+        rec = 1.0 + float(d_effect) * np.exp(-K * deltas)
+        self.recency_cache[cache_key] = rec
+        return rec.copy()
+
+    def compute_rules_array(self, basket):
+        """
+        Compute the rules feature array for a given basket.
+
+        Args:
+            basket : set
+                The set of items in the basket.
+
+        Returns:
+            rules_arr : numpy.ndarray
+                A vector of the rules feature for all items.
+        """
+        rules_arr = np.zeros(self.n_items, dtype=np.float32)
+        if not basket: return rules_arr
+        
+        current = set(basket)
+        for ant, boost_dict in self.rules_boost.items():
+            if set(ant).issubset(current):
+                for item, val in boost_dict.items():
+                    idx = self.item_to_index.get(item)
+                    if idx is not None:
+                        rules_arr[idx] += val
+        if rules_arr.max() > 0:
+            rules_arr /= rules_arr.max()
+        return rules_arr
+
+    def compute_discount_array(self, discount_dict):
+        """
+        Compute the discount feature array for a given discount dictionary.
+
+        Args:
+            discount_dict : dict
+                A dictionary of item to discount value.
+
+        Returns:
+            arr : numpy.ndarray
+                A vector of the discount feature for all items.
+        """
+        arr = np.zeros(self.n_items, dtype=np.float32)
+        if not discount_dict: return arr
+        
+        if discount_dict:
+            for item, val in discount_dict.items():
+                idx = self.item_to_index.get(item)
+                if idx is not None:
+                    arr[idx] = math.log1p(val)
+        if arr.max() > 0:
+            arr /= (arr.max() + EPS)
+        return arr
+
+    def compute_price_array(self, budget):
+        """
+        Compute the price feature array for a given budget.
+
+        Args:
+            budget : float
+                The budget for the recommendation.
+
+        Returns:
+            arr : numpy.ndarray
+                A vector of the price feature for all items.
+        """
+        arr = np.zeros(self.n_items, dtype=np.float32)
+        if budget is None:
+            return arr
+        prices = self.item_data['Current_Price'].values
+        arr = np.log1p(budget / (prices + EPS)).astype(np.float32)
+        return arr / (arr.max() + EPS)
+    
+    def compute_description_boost(self, baskets_df):
+        """
+        Compute the description similarity feature array for a given baskets dataframe.
+
+        Args:
+            baskets_df : pd.DataFrame
+                A dataframe containing all baskets being processed.
+
+        Returns:
+            desc_map : dict
+                A dictionary mapping each basket index to its corresponding description similarity feature array.
+        """
+        if self.similarity_matrix is None:
+            raise ValueError("Description similarity not available. Enable include_description at init.")
+        
+        desc_map = {}
+        for idx, row in baskets_df.iterrows():
+            basket_items = set(row['StockCode']) if isinstance(row['StockCode'], (list, set)) else set()
+            if not basket_items:
+                desc_map[idx] = np.zeros(self.n_items, dtype=np.float32)
+                continue
             
-            Limit = budget[idx] if budget[idx] else budget[cid]
-            P_map_ui = self.compute_price_bias(budget=Limit)
+            # map items to indicies
+            basket_idx = [self.item_to_index[item] for item in basket_items if item in self.item_to_index]
+            sim_vec = self.similarity_matrix[basket_idx].toarray()  # shape: len(basket) x n_items
+            avg_vec = sim_vec.mean(axis=0)
+            max_val = avg_vec.max()
+            desc_map[idx] = avg_vec / max_val if max_val>0 else np.zeros(self.n_items, dtype=np.float32)
+        return desc_map
+    
+    
+    
+    # ===  Helper: Compute all features in batch form   ===
+    def _compute_features_batch(self, baskets_df, d_effect=None, budget_for_batch=None, discount_for_batch=None):
+        """
+        Vectorized feature assembler that returns dict with arrays shape (batch_size, n_items)
+        Keys: 'H','R','T','P','D'
+        Safe with empty baskets. Uses compute_* methods above.
+        """
+        if d_effect is None:
+            d_effect = float(self.d_effect)
+
+        n = len(baskets_df)
+        H = np.zeros((n, self.n_items), dtype=np.float32)
+        R = np.zeros((n, self.n_items), dtype=np.float32)
+        T = np.ones((n, self.n_items), dtype=np.float32)
+        P = np.zeros((n, self.n_items), dtype=np.float32)
+        D = np.zeros((n, self.n_items), dtype=np.float32)
+
+        # iterate rows (we keep one loop over batch only)
+        for i, row in enumerate(baskets_df.itertuples(index=False)):
+            # robust extraction of items (you use 'StockCode' or 'X' in different places)
+            basket_items = []
+            if hasattr(row, 'StockCode') and isinstance(row.StockCode, (list, set)):
+                basket_items = row.StockCode
+            elif hasattr(row, 'X') and isinstance(row.X, (list, set)):
+                basket_items = row.X
+
+            if not basket_items:
+                # leave H=0,R=0,P=0,D=0 and T=1 (no recency boost)
+                T[i, :] = 1.0
+                continue
+
+            cid = getattr(row, 'Customer ID', -1)
+            H[i, :] = self.compute_history(cid)
+            R[i, :] = self.compute_rules_array(basket_items)
+            T[i, :] = self.compute_recency(cid, d_effect=d_effect)
+
+            # --- Budget handling ---
+            budget_val = None
+            if isinstance(budget_for_batch, (int, float)):
+                budget_val = budget_for_batch
+            elif isinstance(budget_for_batch, (list, np.ndarray, pd.Series)) and len(budget_for_batch) > i:
+                budget_val = budget_for_batch[i]
+            elif 'pseudo_budget' in baskets_df.columns:
+                budget_val = baskets_df.iloc[i]['pseudo_budget']
+
+            if budget_val is not None and not np.isnan(budget_val):
+                P[i, :] = self.compute_price_array(budget_val)
+
+            # --- Discount handling ---
+            if isinstance(discount_for_batch, dict):
+                D[i, :] = self.compute_discount_array(discount_for_batch)
+
+        return {'H': H, 'R': R, 'T': T, 'P': P, 'D': D}
+
+    # ------------------ Recommendation ------------------
+    def recommend(self, baskets, budget_dict=None, discount_dict=None, top_n=5):
+        """
+        Produce top-N recommended items for each basket in `baskets` DataFrame.
+        Returns a dict: basket_index -> DataFrame with columns [StockCode, Description, Current_Price, Probability, Rank]
+            - baskets: DataFrame with columns at least ['Customer ID', 'StockCode'] OR ['Customer ID', 'X'] (X is list of codes)
+            - Coefficients: dict overrides for weights (alpha,beta,gamma,delta,eta)
+            - budget_dict: either a single numeric budget or dict mapping customer/basket to budget (if dict, this function pulls budget per basket)
+            - discount_dict: dict of discounts for the batch (applies to all baskets processed)
+        """
+        params = copy.deepcopy(self.weights)
+        
+        " If top_n == -1, then return all items "
+        results = {}
+        discount_arr = self.compute_discount_array(discount_dict)
+        price_arr = self.compute_price_array(budget_dict)
+
+
+        if self.include_description:
+            Desc_map = self.compute_description_boost(baskets)
+
+        if self.iteration_bar:
+            looper = tqdm.tqdm(baskets.iterrows(), total=len(baskets))
+        else:
+            looper = baskets.iterrows()
+         
+        for idx, row in looper:
+            cid = row.get('Customer ID', -1)
+            basket_items = row['StockCode'] if isinstance(row['StockCode'], (list, set)) else []
+
+            # Precompute all dense feature arrays
+            H = self.compute_history(cid)
+            T = self.compute_recency(cid)
+            R = self.compute_rules_array(basket_items)
             
-            # Isolate Features for individual basket
-            H_i = H_map_u[cid]
-            T_i = T_map_u[cid]
-            R_i = R_map_ui[idx]
-            C_i = C_map_i[idx]
+            if self.include_description:
+                Desc = Desc_map.get(idx, np.zeros(self.n_items, dtype=np.float32))
+
+            # Vectorized scoring
+            logit = (
+                self.Bias
+                + self.weights['alpha'] * H
+                + self.weights['beta'] * R
+                + self.weights['eta'] * discount_arr
+                + self.weights['delta'] * price_arr
+                + self.weights['gamma'] * T
+            )
+
+            if self.include_description:
+                logit += self.weights['epsilon'] * (1 + np.log(Desc))
+
+            # Softmax probability
+            exps = np.exp(logit - logit.max())
+            prob = exps / (exps.sum() + EPS)
+
+            # Top-N items
+            if top_n == -1:
+                top_idx = np.argsort(prob)[::-1]
+                top_codes = self.all_items[top_idx]
+            else:
+                top_idx = np.argpartition(prob, -top_n)[-top_n:]
+                top_idx = top_idx[np.argsort(prob[top_idx])[::-1]]
+            top_codes = self.all_items[top_idx]
+            top_probs = prob[top_idx]
+
+            df_top = (
+                self.item_data[self.item_data['StockCode'].isin(top_codes)]
+                .copy()
+                .set_index('StockCode')
+                .loc[top_codes]
+                .reset_index()
+            )
+            df_top['Probability'] = top_probs
+            df_top['Rank'] = np.arange(1, len(df_top) + 1)
             
-            logit = {}
-            # Compute logit for all items
-            for item in self.all_items: # all items in catalog
-                logit[item] = Bias_i.get(item,0) + self.alpha*H_i.get(item,0) + self.beta*R_i.get(item,0)+ self.eta*D_map_i[item] + self.gamma*P_map_ui.get(item,0) \
-                    + self.delta*np.log(T_i.get(item, 0.5)) + self.episilon*np.log(1+C_i.get(item, 0))
-                    # as default recency bias is 0.5
+            # if df_top.shape[0] < self.n_items:
+            #     print("Items skipped")
+            
+            results[idx] = df_top
+
+        return results
+    
+    # ----- Analytical Model training -----
+    # ----- Analytical Model training -----
+    def train_model(self, Carts, lr=0.05, n_iter=20, error=1e-6, sample_size=None,
+                batch_size=32, top_n=10, budget_column=None, verbose=True):
+        params = self.weights.copy()
+        params['d_effect'] = self.d_effect
+        history = []
+        error = 1e-6
+
+        def map_targets_to_indices(Y_batch):
+            return np.array([self.item_to_index.get(y, -1) for y in Y_batch], dtype=int)
+
+        for epoch in range(1, n_iter + 1):
+            # Optional sampling for speed
+            if sample_size is not None and sample_size < len(Carts):
+                Carts_epoch = Carts.sample(sample_size, random_state=epoch)
+            else:
+                Carts_epoch = Carts
+
+            n_batches = int(np.ceil(len(Carts_epoch) / batch_size))
+
+            total_loss = 0.0
+            total_count = 0
+            correct_total = 0
+            grads = {key: 0.0 for key in params.keys()}
+
+            loop = range(n_batches) if not verbose else tqdm.tqdm(range(n_batches), desc=f"Epoch {epoch}/{n_iter}")
+            for b in loop:
+                batch = Carts_epoch.iloc[b * batch_size:(b + 1) * batch_size]
+                if batch.empty:
+                    continue
                 
-            ## Softmax Normalization for probabilities
-            Probability = self.Softmax_normalizer(logit)
-            
-            # Taking Top n items
-            top_items = dict(sorted(Probability.items(), key=lambda x: x[1], reverse=True)[:top_n+int(np.sqrt(top_n))])
-            Top_item_data = self.item_data.loc[self.item_data['StockCode'].isin(top_items.keys())].copy()
-            Top_item_data['Probability'] = Top_item_data['StockCode'].map(top_items)
-            Results[idx] = Top_item_data
+                # extract budget if applied
+                budget_for_batch = None
+                if budget_column and budget_column in batch.columns:
+                    budget_for_batch = batch[budget_column].values
+
+                X_batch = batch.drop(columns=['Y'])
+                feats = self._compute_features_batch(X_batch)
+                Y_batch = batch['Y'].values
+                Y_idx = map_targets_to_indices(Y_batch)
+                valid_mask = (Y_idx != -1)
+
+                # --- Forward ---
+                logit = (self.Bias
+                         + params['alpha'] * feats['H']
+                         + params['beta'] * feats['R']
+                         + params['gamma'] * feats['T']
+                         + params['delta'] * feats['P']
+                         + params['eta'] * feats['D']).astype(np.float32)
+
+                if self.include_description and self.weights['epsilon'] != 0.0:
+                    Desc_map = self.compute_description_boost(X_batch)
+                    Desc_mat = np.vstack([Desc_map[i] for i in X_batch.index]) # shape [batch_size, n_items]
+                    # transformation in your model: epsilon * log(1 + C)
+                    Desc_log = np.log1p(Desc_mat + error)
+                    logit += self.weights['epsilon'] * Desc_log
+
+                logit -= logit.max(axis=1, keepdims=True).astype(np.float32)
+                exps = np.exp(logit)
+                probs = exps / (exps.sum(axis=1, keepdims=True) + EPS) # [batch_size, n_items]
+
+                # --- Loss ---
+                row_ids = np.arange(len(Y_batch))[valid_mask]
+                p_y = probs[row_ids, Y_idx[valid_mask]]
+
+                if top_n != -1 and top_n < self.n_items:
+                    part = np.argpartition(probs, -top_n, axis=1)[:, -top_n:]
+                    order = np.argsort(probs[np.arange(probs.shape[0])[:, None], part], axis=1)[:, ::-1]
+                    top_idx_matrix = np.take_along_axis(part, order, axis=1)
+                    isin_top = np.array([Y_idx[i] in top_idx_matrix[i] for i in row_ids], dtype=bool)
+                    
+                    if isin_top.any():
+                        idxs_ok = row_ids[isin_top]
+                        total_loss += -np.log(probs[idxs_ok, Y_idx[valid_mask][isin_top]] + EPS).sum()
+                    
+                    penalized_count = (~isin_top).sum()
+                    if penalized_count > 0:
+                        total_loss += (-np.log(error)) * penalized_count
+                else:
+                    total_loss += -np.log(p_y + EPS).sum()
+
+                total_count += valid_mask.sum()
+
+                # --- Accuracy ---
+                if top_n == -1 or top_n >= self.n_items:
+                    top_idx_matrix_full = np.argsort(probs, axis=1)[:, ::-1]
+                else:
+                    part = np.argpartition(probs, -top_n, axis=1)[:, -top_n:]
+                    order = np.argsort(probs[np.arange(probs.shape[0])[:, None], part], axis=1)[:, ::-1]
+                    top_idx_matrix_full = np.take_along_axis(part, order, axis=1)
+                
+                topn_codes = self.all_items[top_idx_matrix_full]
+                true_codes = Y_batch[valid_mask][:, None]
+                valid_topn_codes = topn_codes[valid_mask]
+                correct_total += int(np.sum(np.any(valid_topn_codes == true_codes, axis=1)))
+
+                # --- Gradients ---
+                one_hot = np.zeros_like(probs ,dtype=np.float32)
+                one_hot[np.arange(len(Y_batch))[valid_mask], Y_idx[valid_mask]] = 1.0
+                
+                # derivative of cross-entropy wrt logits
+                diff = (probs - one_hot) / len(Y_batch)
+
+                grads['alpha'] += np.sum(diff * feats['H'])
+                grads['beta'] += np.sum(diff * feats['R'])
+                grads['gamma'] += np.sum(diff * feats['T'])
+                grads['delta'] += np.sum(diff * feats['P'])
+                grads['eta'] += np.sum(diff * feats['D'])
+                
+                if self.include_description and self.weights['epsilon'] != 0.0:
+                    grads['epsilon'] = grads.get('epsilon', 0.0) + np.sum(diff * Desc_log)
+                else:
+                    grads['epsilon'] = grads.get('epsilon', 0.0) # ensure key exists
+
+                # feats['T'] = 1 + d_effect * exp(-K * delta) 
+                # dT/d(d_effect) = exp(-K * delta)
+                # so d(logit)/ dT * dT/d(d_effect) =  d(logit)/d(d_effect) = gamma * exp(-K * delta)
+                # compute exp(-K * delta) safely: feats['T'] - 1 = d_effect * exp(-K * delta)  => exp(-K * delta) = (T - 1)/d_effect  (d_effect used to compute feats)
+                
+                d_eff_val = float(params.get('d_effect', 0.0))
+                if abs(d_eff_val) > 1e-12:
+                    E_mat = (feats['T'] - 1.0) / (d_eff_val + EPS)
+                else:
+                    # fallback: if d_effect is ~0 , approximate exp(-K * delta) as T-1 because T ≈ 1 + small*E
+                    E_mat = (feats['T'] - 1.0)
+                grads['d_effect']  = grads.get('d_effect', 0.0) + np.sum(diff * (params['gamma']* E_mat))
+
+            # Normalize + update
+            if total_count == 0:
+                if verbose:
+                    print("No valid samples; stopping early.")
+                break
+            for k in grads.keys():
+                grads[k] /= max(1, total_count)
+                params[k] -= lr * grads[k]
+
+            self.weights = {k: v for k, v in params.items() if k != 'd_effect'}
+            self.d_effect = params['d_effect']
+
+            epoch_loss = total_loss / max(1, total_count)
+            epoch_acc = correct_total / max(1, total_count)
+            history.append((epoch_loss, epoch_acc, copy.deepcopy(params)))
+
+            if verbose:
+                print(f"Epoch {epoch}/{n_iter} | Loss: {epoch_loss:.6f} ") # | Acc: {epoch_acc:.4f}
+                print(f"params: { {k: round(v,4) for k,v in params.items()} }")
+                print(f"Correct predictions:  {correct_total}/{total_count} "  )
+
+        final_weights = copy.deepcopy(params)
         
-        return Results
+        return final_weights, history
 
 
 
-rec = Retail_Recommendation(items, customer, association=rules, Initial_weights=params, d_effect=0.5,
-    current_date=Today, vectorizer=vectorizer)
-basket1 = baskets.iloc[2:6]
-rec.recommend(baskets, Coefficients=params, budget=None, Discount_list=None, top_n=5)
