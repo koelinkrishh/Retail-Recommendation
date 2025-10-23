@@ -79,17 +79,18 @@ class Retail_Recommendation:
 
         # Time and weights
         default_weights = {
-            'alpha': 0.5,   # history
-            'beta': 0.4,    # rules
-            'gamma': 0.2,   # recency multiplier weight
-            'delta': 0.1,   # price
-            'epsilon': 0.3, # description similarity
-            'eta': 0.3,     # discount
+            'alpha': 1.0,   # history
+            'beta': 1.0,    # rules
+            'delta': 0.5,   # price
+            'eta': 0.5,     # discount
+            'gamma': 0.5,   # recency multiplier weight
+            'epsilon': 0.2, # description similarity
+            'd_effect': 0.5 # recency decay strength
         }
         self.weights = default_weights if initial_weights is None else dict(initial_weights)
-        # ensure all keys exist
-        for k, v in default_weights.items():
-            self.weights.setdefault(k, v)
+        # # ensure all keys exist
+        # for k, v in default_weights.items():
+        #     self.weights.setdefault(k, v)
 
         if d_effect is not None:
             self.d_effect = d_effect
