@@ -4,10 +4,10 @@ import os
 
 # Base directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "..", "Data")
+DATA_DIR = os.path.join(BASE_DIR, "..", "Data","Code_run")
 
 # File paths
-RAW_DATA_PATH = os.path.join(DATA_DIR, "online_retail_II.xlsx")
+RAW_DATA_PATH = os.path.join(DATA_DIR, "..","online_retail_II.xlsx")
 RAW_PATH_parquet = os.path.join(DATA_DIR, "raw_data.parquet")
 RAW_PATH_csv = os.path.join(DATA_DIR, "raw_data.csv")
 
@@ -28,7 +28,8 @@ Rules_data_PATH = os.path.join(DATA_DIR, "rules.pkl")
 # Model paths
 Model_dir = os.path.join(BASE_DIR, "..", "Models")
 
-Vectorizer_data_PATH = os.path.join(Model_dir, "vectorizer.joblib")
+Vectorizer_data_PATH = os.path.join(DATA_DIR, "vectorizer.joblib")
+Vocabulary_data_PATH = os.path.join(DATA_DIR, "vocabulary.joblib")
 Best_model_path = os.path.join(Model_dir, "Final_model.joblib")
 
 # Experiements results

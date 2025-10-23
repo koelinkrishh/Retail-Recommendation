@@ -55,8 +55,8 @@ class DataTransformation:
         """Function to clean datetime column an create features. """
         logging.info("Working on Datetime column")
         self.data['InvoiceDate'] = pd.to_datetime(self.data['InvoiceDate'], errors='coerce')
-        self.data['Purchase_Date'] = self.data['InvoiceDate'].dt.date
-        self.data['Purchase_time'] = self.data['InvoiceDate'].dt.time
+        self.data['Purchase_Date'] = self.data['InvoiceDate'].dt.normalize() # midnight average
+        self.data['Purchase_time'] = self.data['InvoiceDate'].dt.strftime('%H:%M:%S') # keep as string but stardardized
         
         if 'Purchase_Time' not in self.data.columns:
             logging.warning("'Purchase_Time' not found — creating it from 'Purchase_Date' if available")
@@ -192,7 +192,7 @@ class DataTransformation:
             rows_to_drop.update(accidental_row)
             # print(len(rows_to_drop))
             
-            useless_trans = self.data[(self.data['Quantity'] <= 0) & (self.data['Price'] <= 0)].index
+            useless_trans = self.data[(self.data['Quantity'] <= 0) | (self.data['Price'] <= 0)].index
             logging.info(f"Found {len(useless_trans)} useless transactions. Removing them")
             rows_to_drop.update(useless_trans)
             # print(len(rows_to_drop))
