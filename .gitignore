@@ -1,0 +1,100 @@
+## Writing gitignore file
+# ---- Python build & cache files ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# ---- Jupyter notebooks ----
+.ipynb_checkpoints/
+Data/Database/
+Data/Code_run/*.pkl
+Data/Code_run/*.parquet
+Data/Code_run/*.csv
+Data/Code_run/*.joblib
+Data/*.pkl
+Data/*.parquet
+Data/*.xlsx
+Data/*.csv
+Data/*.db
+Data/*.json
+experiments/*.pkl
+
+experiments/
+*.pkl
+
+Data/
+*.csv
+*.pkl
+*.joblib
+*.db
+
+# Ignore data and heavy intermediate files
+*.log
+*.tmp
+
+# Ignore Jupyter checkpoints and cache
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Ignore IDE and environment folders
+.vscode/
+.idea/
+.env/
+.venv/
+
+
+# ---- Data files (large or raw) ----
+# Data/
+# data/
+# datasets/
+# *.csv
+# *.tsv
+# *.xlsx
+# *.xls
+# *.pkl
+# *.pickle
+# *.feather
+# *.parquet
+# *.json
+# *.zip
+
+# ---- Model weights or outputs ----
+# models/
+# outputs/
+# results/
+*.h5
+*.pt
+# *.joblib
+*.sav
+*.npy
+*.npz
+
+# ---- Environment / configuration ----
+.env
+*.env
+.venv/
+venv/
+ENV/
+env/
+*.log
+logs
+
+# ---- IDE / Editor specific ----
+.vscode/
+.idea/
+*.iml
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Temporary / scratch ----
+tmp/
+temp/
+scratch/

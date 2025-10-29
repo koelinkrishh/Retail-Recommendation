@@ -1,0 +1,345 @@
+EPS = 1e-9  # small constant to avoid log(0) / division by zero
+DEFAULT_HALF_LIFE_DAYS = 7  # used in recency k_max
+MAGIC_KMIN_PERIOD = 30  # relative baseline for kmin computation (can be tuned)
+Today = df['Purchase Date'].max().date() + pd.DateOffset(days=1)
+Time_period = (df['Purchase Date'].max() - df['Purchase Date'].min()).days
+
+class Retail_Recommendation():
+    """
+    Batch-capable hybrid recommender combining:
+      - item bias (popularity)
+      - per-customer purchase history affinity
+      - association-rule boosts
+      - per-basket description similarity
+      - per-basket / per-customer price-affordability (budget)
+      - recency boost per (user,item)
+      - discount boost (batch-level)
+    
+    This class computes item-level arrays once and then scores baskets in vectorized form.
+    """
+    def __init__(self, item_data=items, customer_data=customer, association=rules, vectorizer=None, vectorizer_path=None, 
+            Initial_weights=None, d_effect=1, current_date=None, Time_period=None
+        ## These variable are basket specific
+            # Id=-1, budget=None, Discount=None
+        ):
+        """
+        Args:
+            items_df (pd.DataFrame): must contain ['StockCode','Description','Current_Price',
+                                                  'Total_quantity','Num_orders'].
+            customer_df (pd.DataFrame): rows may contain dicts in columns 'Purchase count',
+                                        'Purchase quantity', 'Last purchase date'.
+            rules_df (pd.DataFrame): cols ['antecedent','consequent','confidence','lift'].
+            vectorizer: optional pre-trained sklearn vectorizer for descriptions (TF-IDF).
+            vectorizer_path: Path to pre-trained sklearn vectorizer for descriptions (TF-IDF).
+            initial_weights: dict with keys alpha,beta,delta,gamma,epsilon,eta (defaults used if None).
+            d_effect: base recency multiplier for items (floats).
+            today: pd.Timestamp or pd.Date for "current" date; if None derived from items_df if possible.
+            time_period: integer days span; if None computed from items_df.
+        """
+        self.item_data = item_data
+        self.customer_data = customer_data
+        self.association_rules = association
+        
+        if Initial_weights is None:
+            Initial_weights = {}
+        
+        self.all_items = np.asarray(self.item_data['StockCode'].unique())
+        self.item_to_index = {item: i for i, item in enumerate(self.all_items)}
+        
+        self.n_items = len(self.all_items)
+        # Hyper-parameters ( weights )
+        if Initial_weights is None:
+            Initial_weights = {'alpha': 0.5, 'beta': 0.4, 'delta': 0.1, 'gamma': 0.2, 'epsilon': 0.3, 'eta': 0.3}
+        self.Coefficients = Initial_weights
+        
+        self.d_effect = float(d_effect)
+        
+        # Today & Time period
+        if current_date is None:
+            self.current_date = pd.Timestamp.now().date()
+        else:
+            self.current_date = pd.Timestamp(current_date)
+        if Time_period is None:
+            self.Time_period = (self.item_data['Last_sale'].max() - self.item_data['Last_sale'].min()).days or MAGIC_KMIN_PERIOD
+        else:
+            self.Time_period = Time_period
+        
+        """  CODE -> For optimization """
+        # cache for memoization -> Skip all repetitive computations
+        self.history_cache = {} 
+        self.recency_cache = {}
+        
+        # Item bias precomputed as it is same for all baskets
+        self.Bias = self.compute_bias()
+        # Dictionary mapping each rules with its items with quantities
+        self.rules_mapper = self._build_rules_index()
+        
+        # Prepare vocabulary-> Description first 3 steps
+        # step-1: Clean item description
+        if 'Clean_Description' not in self.item_data.columns:
+            self.item_data['Clean_Description'] = self.item_data['Description'].str.lower().str.replace('[^A-Za-z]+', ' ', regex=True).str.strip()
+        
+        # step-2: First Load Vocabulary (or Train)
+        if vectorizer is not None:
+            self.vectorizer = vectorizer
+        elif vectorizer_path is not None:
+            self.vectorizer = joblib.load(vectorizer_path)
+        else: # train vectorizer from scratch
+            vocab = TfidfVectorizer(ngram_range=(1,2), stop_words='english')
+            vocab.fit(self.item_data['Clean_Description'])
+            # store it back for future use
+            self.vectorizer = vocab
+            
+        # step-3: Vectorize the item catalog (sparse matrix)
+        self.item_desc_matrix = self.vectorizer.transform(self.item_data['Clean_Description'])
+        
+        
+    # ----- Helper/Utility functions -----   
+    @staticmethod ## methods which dont need object
+    def normalize_dict(d:dict):
+        if not d: return {}
+        max_val = max(d.values()) if d else 1
+        return {k: v / max_val for k, v in d.items()}
+    
+    @staticmethod
+    def Softmax_normalizer(x:dict):
+        if not x: return {}
+        val = np.array(list(x.values()))
+        prob = (val - val.min())/(val.max() - val.min())
+        e_x = np.exp(prob)
+        prob = e_x / e_x.sum()
+        return dict(zip(x.keys(), prob))
+    
+    def _build_rules_index(self):
+        """
+        Build a dictionary mapping antecedent tuple (sorted) -> list of (consequent_list, confidence, lift).
+        """
+        rules_lookup = defaultdict(list) # dictionary for faster lookup -> *O[1]
+        for _,row in self.association_rules.iterrows():
+            ant = tuple(sorted(row['antecedent']))
+            rules_lookup[ant].append(row)
+        return rules_lookup
+        
+    
+    # --------------------------------------------------
+    # ----- Feature computation -----
+    # --------------------------------------------------
+    
+    # ----- Base Line features -----
+    def compute_bias(self):
+        bias = {}
+        for _,row in self.item_data.iterrows():
+            bias[row['StockCode']] = np.log1p(row['Frequency'])
+        return self.normalize_dict(bias)
+    
+    # ----- Per-customer cached factors -----
+    def compute_history(self, cust_id):
+        """ cust_ids : customer id for current customer """
+        if cust_id in self.history_cache: # use cache for memoization
+            return self.history_cache[cust_id]
+        
+        # All baskets from this customer
+        cust_data = self.customer_data[self.customer_data['Customer ID']==cust_id]
+        if cust_data.empty:
+            self.history_cache[cust_id] = {}
+            return {}
+        
+        counts = cust_data['Purchase count'].values[0]
+        qty = cust_data['Purchase quantity'].values[0]
+        history = {}
+        for item in counts.keys():
+            history[item] = np.log1p(qty.get(item, 0) / counts.get(item, 0))
+        
+        self.history_cache[cust_id] = self.normalize_dict(history) # store for later use
+        return self.history_cache[cust_id]
+        
+    def compute_recency_bias(self, cust_id):
+        if cust_id in self.recency_cache: # use cache for memoization
+            return self.recency_cache[cust_id]
+        
+        recency = {item: d_effect for item in self.all_items} # Recency vector
+        cust_data = self.customer_data[self.customer_data['Customer ID']==cust_id] # each customer's data
+        if cust_data.empty:
+            self.recency_cache[cust_id] = recency
+            return recency
+            
+        qty_dict = cust_data['Purchase quantity'].values[0]
+        last_purchase = cust_data['Last purchase date'].values[0]
+        
+            # for each item, Frequency of purchase
+        freq = {}
+        for item in self.all_items: 
+            qty = qty_dict.get(item, 0)
+            freq[item] = np.sqrt(np.log1p(qty)) #
+        freq = self.normalize_dict(freq)
+        
+        kmax = np.log(2)/ self.Time_period
+        kmin = np.log(2)/ (DEFAULT_HALF_LIFE_DAYS or 30)
+        
+        last_purchase = cust_data['Last purchase date'].values[0]
+        
+        # for each item:
+        for item in self.all_items:
+            # Time since last purchase -> delta=0 for fresh items
+            delta_days = (self.current_date - last_purchase.get(item, self.current_date)).days
+            K = kmin + (kmax - kmin) * freq.get(item, 0)
+            recency[item] *= (1 + np.exp(-K * delta_days))
+        
+        self.recency_cache[cust_id] = recency # store for later use
+        return self.recency_cache[cust_id]
+    
+    # ----- Item + basket depended factors -> computed for each basket -----
+    def compute_price_bias(self, budget=None):
+        price_bias = {}
+        if budget is None:
+            return price_bias
+        
+        for _, row in self.item_data.iterrows():
+                ratio = budget / row.get('Current Price', 0)
+                price_bias[row['StockCode']] = np.log1p(ratio)
+        return self.normalize_dict(price_bias)
+    
+    # ----- Item based Features -----
+    def compute_discount_boost(self, Discount=None):
+        if Discount is None: return {}
+        boost = {item: np.log1p(Discount[item]) for item in Discount.keys()}
+        return self.normalize_dict(boost)
+    
+    # ----- Basket depended factors -----
+    def compute_rules_boost(self, baskets_df):
+        baskets_rule_map = {}
+        
+        for idx, row in baskets_df.iterrows(): # for each basket
+            if isinstance(row['StockCode'], (list,set)):
+                current_basket = set(row['StockCode'])
+            else: # empty basket
+                current_basket = set()
+            
+            rules_boost = {}
+            itemsets = set(list(combinations(current_basket, 1)) + list(combinations(current_basket, 2)))
+            
+            """ We have an better version of this part
+            for itemset in itemsets:
+                matches = self.association_rules[self.association_rules['antecedent'] == itemset] # list lookup -> O[n]
+                for _, r in matches.iterrows():
+                    for item in r['consequent']:
+                        boost = r['confidence'] * np.log1p(r['lift'])
+                        rules_boost[item] = rules_boost.get(item, 0) + boost
+            """
+            
+            for itemset in itemsets:
+                itemset = tuple(sorted(itemset))
+                for row in self.rules_mapper.get(itemset, []): # O[1] lookup
+                    for item in row['consequent']:
+                        boost = row['confidence'] * np.log1p(row['lift'])
+                        rules_boost[item] = rules_boost.get(item, 0) + boost
+            
+            # for each basket
+            baskets_rule_map[idx] = self.normalize_dict(rules_boost)
+        return baskets_rule_map
+    
+    
+    
+    def compute_description_similarity(self, baskets):
+        """ Compute TF-IDF based description similarity for each basket.
+            Returns: dict[basket_index] -> {item_code: similarity_score}
+        """
+        ## STEP 1-3 done in init -> avoid repeatation
+        # step-4: Iterate over each basket
+        basket_similarity_map = {}
+        for idx, row in baskets.iterrows():
+            if isinstance(row['StockCode'], (list,set)):
+                current_basket = set(row['StockCode'])
+            else: # empty basket
+                current_basket = set()
+            
+            if not current_basket:
+                basket_similarity_map[idx] = {}
+                continue
+            
+            # step-5: Find all basket item vectors
+            basket_ind = np.isin(self.all_items, list(current_basket))
+            basket_vector = self.item_desc_matrix[basket_ind] ## (no of items in basket X n_features)
+            ## average semantic meaning of all items in basket -> Capture overall basket's theme
+            basket_mean = np.asarray(basket_vector.mean(axis=0)) # (1 X n_features)
+            
+            # step-6: Filter out items already in basket  for recommendation
+            mask = ~basket_ind
+            avaliable_items = self.all_items[mask]
+            avaliable_items_matrix = self.item_desc_matrix[mask]
+            
+            # step-7: Compute cosine similarity:
+            """ We will also flatten out similarity -> one vector per item in the catalog """ 
+# Idea: "“How similar is this catalog item’s description to the average semantic theme of the basket?”"
+            sims = cosine_similarity( avaliable_items_matrix, basket_mean ).flatten()
+            
+            # step-8: Store similarity score for current basket
+            basket_similarity_map[idx] = {item: score for item, score in zip(avaliable_items, sims) if score > 0}
+        
+        return basket_similarity_map
+    
+    # ----- Aggregation -----
+    def recommend(self, baskets, Coefficients = None, budget=None, Discount_list=None, top_n = 5):
+        """ Final Function to aggregate all features for recommendation system. 
+        
+        Args:
+        baskets: pd.DataFrame
+            Collections of all baskets being processing currently along with customer_ids
+        Coefficients : dict
+            All features weights -> Need to given while training
+        budget: dict
+            Budget associated with each baskets
+        Discount_list: dict
+            Percentage of discount for each item
+        top_n: integer
+            How many items to recommend
+        
+        """
+        # Precomputing each effect
+        R_map_ui = self.compute_rules_boost(baskets) # recency bias for each customer for each item
+        C_map_i = self.compute_description_similarity(baskets) # description similarity score for each item
+        D_map_i = self.compute_discount_boost(Discount=Discount_list) # discount applied on each item
+        
+        Results = {} # Each baskets probability
+        # for each baskets
+        for idx, row in tqdm.tqdm(baskets.iterrows()):
+            cid = row.get('Customer ID', -1)
+            baskets_items = row['StockCode'] if isinstance(row['StockCode'], (list,set)) else []
+            
+            if budget is None:
+                Limit = None
+            else:
+                Limit = budget.get(idx, 0)
+            P_map_ui = self.compute_price_bias(budget=Limit)
+            
+            # Isolate Features for individual basket
+            H_i = self.compute_history(cid)
+            T_i = self.compute_recency_bias(cid)
+            R_i = R_map_ui[idx]
+            C_i = C_map_i[idx]
+            
+            logit = {}
+            # Compute logit for all items
+            for item in self.all_items: # all items in catalog
+                logit[item] = self.Bias.get(item,0) + self.alpha*H_i.get(item,0) + self.beta*R_i.get(item,0) + \
+                    self.eta*D_map_i.get(item, 0) + self.gamma*P_map_ui.get(item,0) + \
+                    self.delta*np.log(T_i.get(item, 0.5)) + self.episilon*np.log(1+C_i.get(item, 0))
+                    # as default recency bias is 0.5
+                
+            ## Softmax Normalization for probabilities
+            Probability = self.Softmax_normalizer(logit)
+            
+            # Taking Top n items
+            top_items = dict(sorted(Probability.items(), key=lambda x: x[1], reverse=True)[:top_n+int(np.sqrt(top_n))])
+            Top_item_data = self.item_data.loc[self.item_data['StockCode'].isin(top_items.keys())].copy()
+            Top_item_data['Probability'] = Top_item_data['StockCode'].map(top_items)
+            Results[idx] = Top_item_data
+        
+        return Results
+
+
+
+rec = Retail_Recommendation(items, customer, association=rules, Initial_weights=params, d_effect=0.5,
+    current_date=Today, vectorizer=vectorizer)
+basket1 = baskets.iloc[2]
+# rec.recommend(baskets, Coefficients=params, budget=None, Discount_list=None, top_n=5)
