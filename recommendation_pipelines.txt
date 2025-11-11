@@ -174,3 +174,9 @@
     - Simple web dashboard.  
     - Show recommended items + images (scraped via API).  
     - Clickable links to simulate purchase flow.
+
+
+<!-- Final Model weights:
+{'alpha': np.float32(2.1774216), 'beta': np.float32(3.9744666), 'gamma': np.float32(1.5444027), 'delta': np.float32(-0.4433973), 'eta': np.float32(0.53207666), 'epsilon': np.float32(0.35471776), 'd_effect': np.float32(1.9278386)}
+Validation metrics:
+{'Precision@N': np.float64(0.007244147157190636), 'Recall@N': np.float64(0.7244147157190636), 'F1@N': np.float64(0.014344845713794867), 'HitRate': 0.7244147157190636, 'MRR@N': np.float64(0.09932481255115745), 'NDCG@N': np.float64(0.21643825650416038), 'MAP@N': np.float64(0.09932481255115745), 'Correct_predictions': 2166, 'Total_baskets': 2990} -->

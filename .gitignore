@@ -27,11 +27,10 @@ experiments/*.pkl
 experiments/
 *.pkl
 
-Data/
-*.csv
-*.pkl
-*.joblib
-*.db
+Data/*.joblib
+# *.csv
+# *.pkl
+# *.db
 
 # Ignore data and heavy intermediate files
 *.log
